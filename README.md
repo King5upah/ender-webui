@@ -64,6 +64,12 @@ Desde otra terminal (o pon `ender` en tu PATH):
 - **Gráficas con Pillow / canvas**, no matplotlib (en algunos Python de Homebrew
   `pyexpat` está roto y matplotlib lo arrastra).
 
+## Settings de impresión
+
+Recomendados (punto de partida genérico) **y probados** (la config exacta que ya
+funciona en esta máquina: cama sándwich de vidrio a 70 °C, brim 5 mm, `M851 Z-1.47`,
+etc.) en **[SETTINGS.md](SETTINGS.md)**.
+
 ## Seguridad
 
 Escucha en `127.0.0.1` (solo local). No lo expongas a internet sin auth/TLS.
