@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""
+ender — CLI para controlar la Ender 3 vía el servidor web local (~/printer/server.py).
+Habla con la API HTTP en http://127.0.0.1:8080 (no toca el serial directo, así no choca).
+
+Uso:
+  ender status                 estado + temperaturas
+  ender temps                  solo temperaturas (una vez)
+  ender watch                  temperaturas en vivo (Ctrl+C para salir)
+  ender send "G28"             manda G-code crudo
+  ender console                consola interactiva (escribe G-code, 'exit' para salir)
+  ender preheat pla|petg       precalienta (PLA 200/60, PETG 240/80)
+  ender preheat 210 65         precalienta hotend 210 / cama 65
+  ender cool                   apaga calentadores y ventilador
+  ender home [xyz]             home (sin args = todo)
+  ender jog X 10               mueve eje (X/Y/Z) la distancia dada (mm)
+  ender files                  lista .gcode disponibles
+  ender upload archivo.gcode   sube un archivo
+  ender print archivo.gcode    imprime un archivo ya subido
+  ender pause | resume | cancel
+  ender slice pieza.stl [escala%] [perfil]   rebana STL -> gcode
+                              (perfil por defecto: cama de vidrio)
+  ender serve                  arranca el servidor si no está corriendo
+"""
+import sys, os, json, time, urllib.request, urllib.error, subprocess
+
+BASE = "http://127.0.0.1:8080"
+HERE = os.path.dirname(os.path.abspath(__file__))
+PRUSA = "/Applications/PrusaSlicer.app/Contents/MacOS/PrusaSlicer"
+PROFILES = os.path.join(HERE, "profiles")
+DEFAULT_PROFILE = "ender3_pla_vidrio"   # cama de vidrio (probado)
+GDIR = os.path.join(HERE, "gcode")
+
+
+def req(path, method="GET", data=None, raw=None, qs=""):
+    url = BASE + path + qs
+    body = None
+    headers = {}
+    if raw is not None:
+        body = raw.encode() if isinstance(raw, str) else raw
+    elif data is not None:
+        body = json.dumps(data).encode()
+        headers["Content-Type"] = "application/json"
+    r = urllib.request.Request(url, data=body, method=method, headers=headers)
+    with urllib.request.urlopen(r, timeout=620) as resp:
+        txt = resp.read().decode()
+        try:
+            return json.loads(txt)
+        except Exception:
+            return txt
+
+
+def server_up():
+    try:
+        req("/api/status")
+        return True
+    except Exception:
+        return False
+
+
+def need_server():
+    if not server_up():
+        print("✗ El servidor no responde en", BASE)
+        print("  Arráncalo con:  ender serve   (o: python3 ~/printer/server.py)")
+        sys.exit(1)
+
+
+def fmt_temps(s):
+    t = s["temps"]
+    return (f"🔥 hotend {t['hotend']:5.1f}° / {t['hotend_t']:.0f}    "
+            f"🛏️  cama {t['bed']:5.1f}° / {t['bed_t']:.0f}")
+
+
+def cmd_status():
+    s = req("/api/status")
+    st = "🟠 imprimiendo" if s["printing"] else ("🟢 lista" if s["connected"] else "⚪️ desconectada")
+    print(f"Estado: {st}   {s.get('port') or ''}")
+    print(fmt_temps(s))
+    p = s["progress"]
+    if p["total"]:
+        pct = 100 * p["done"] / p["total"]
+        pausa = " (PAUSA)" if s["paused"] else ""
+        print(f"Progreso: {p['file']} — {p['done']}/{p['total']} ({pct:.1f}%){pausa}")
+    if s.get("error"):
+        print("⚠️ ", s["error"])
+
+
+def cmd_watch():
+    try:
+        while True:
+            s = req("/api/status")
+            tag = "PRINT" if s["printing"] else ("OK " if s["connected"] else "OFF")
+            line = f"[{tag}] {fmt_temps(s)}"
+            p = s["progress"]
+            if p["total"]:
+                line += f"   {100*p['done']/p['total']:.1f}%"
+            sys.stdout.write("\r" + line + "   ")
+            sys.stdout.flush()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print()
+
+
+def cmd_console():
+    print("Consola G-code. Escribe comandos; 'exit' o Ctrl+D para salir.")
+    while True:
+        try:
+            c = input("ender> ").strip()
+        except EOFError:
+            print(); break
+        if c.lower() in ("exit", "quit", "q"):
+            break
+        if not c:
+            continue
+        req("/api/cmd", "POST", {"cmd": c})
+        time.sleep(0.4)
+        s = req("/api/status")
+        for l in s["log"][-6:]:
+            print("  " + l)
+
+
+PRESETS = {"pla": (200, 60), "petg": (240, 80), "abs": (240, 100)}
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+
+    c = a[0]
+
+    if c == "serve":
+        if server_up():
+            print("✓ El servidor ya está corriendo en", BASE)
+            return
+        print("Arrancando servidor…")
+        subprocess.Popen(["python3", os.path.join(HERE, "server.py")],
+                         stdout=open("/tmp/printer_server.log", "a"),
+                         stderr=subprocess.STDOUT, start_new_session=True)
+        for _ in range(15):
+            time.sleep(1)
+            if server_up():
+                print("✓ Listo en", BASE)
+                cmd_status()
+                return
+        print("✗ No arrancó; revisa /tmp/printer_server.log")
+        return
+
+    if c == "slice":
+        if len(a) < 2 or not os.path.exists(a[1]):
+            print("uso: ender slice /ruta/pieza.stl [escala%]  (archivo .stl debe existir)"); return
+        if not os.path.exists(PRUSA):
+            print("✗ PrusaSlicer no está instalado en", PRUSA); return
+        stl = a[1]
+        scale = (float(a[2]) / 100.0) if len(a) > 2 and a[2].replace('.','').isdigit() else 1.0
+        prof = a[3] if len(a) > 3 else (a[2] if len(a) > 2 and not a[2].replace('.','').isdigit() else DEFAULT_PROFILE)
+        INI = os.path.join(PROFILES, prof if prof.endswith(".ini") else prof + ".ini")
+        if not os.path.exists(INI):
+            print(f"✗ Perfil no existe: {INI}\n  Disponibles: " +
+                  ", ".join(f[:-4] for f in os.listdir(PROFILES) if f.endswith('.ini'))); return
+        name = os.path.splitext(os.path.basename(stl))[0]
+        suffix = f"_{int(scale*100)}pct" if scale != 1.0 else ""
+        out = os.path.join(GDIR, name + suffix + ".gcode")
+        os.makedirs(GDIR, exist_ok=True)
+        cmd_ps = [PRUSA, "--load", INI, "--export-gcode",
+                  "--scale", str(scale), "--center", "110,110",
+                  "-o", out, stl]
+        print(f"Rebanando {os.path.basename(stl)} (escala {scale*100:.0f}%, perfil {prof})…")
+        r = subprocess.run(cmd_ps, capture_output=True, text=True)
+        if r.returncode != 0:
+            print("✗ Error al rebanar:\n", (r.stderr or r.stdout)[-800:]); return
+        print(f"✓ Listo -> {out}")
+        print(f"  Imprime con:  ender print {os.path.basename(out)}")
+        return
+
+    need_server()
+
+    if c == "status":
+        cmd_status()
+    elif c == "temps":
+        print(fmt_temps(req("/api/status")))
+    elif c == "watch":
+        cmd_watch()
+    elif c == "console":
+        cmd_console()
+    elif c == "send":
+        if len(a) < 2:
+            print("uso: ender send \"G28\""); return
+        req("/api/cmd", "POST", {"cmd": " ".join(a[1:])})
+        time.sleep(0.5)
+        for l in req("/api/status")["log"][-6:]:
+            print("  " + l)
+    elif c == "preheat":
+        if len(a) >= 3:
+            h, b = int(a[1]), int(a[2])
+        elif len(a) == 2 and a[1].lower() in PRESETS:
+            h, b = PRESETS[a[1].lower()]
+        else:
+            print("uso: ender preheat pla|petg|abs   ·   ender preheat <hotend> <cama>"); return
+        req("/api/preheat", "POST", {"hotend": h, "bed": b})
+        print(f"Precalentando → hotend {h}° / cama {b}°")
+    elif c in ("cool", "cooldown"):
+        req("/api/cooldown", "POST", {})
+        print("Calentadores y ventilador apagados ❄️")
+    elif c == "home":
+        ax = " ".join(list(a[1].upper())) if len(a) > 1 else ""
+        req("/api/home", "POST", {"axes": ax})
+        print("Home", ax or "todo", "✓")
+    elif c == "jog":
+        if len(a) < 3:
+            print("uso: ender jog X 10"); return
+        req("/api/jog", "POST", {"axis": a[1].upper(), "dist": float(a[2])})
+        print(f"Movido {a[1].upper()} {a[2]}mm")
+    elif c == "files":
+        fs = req("/api/files")["files"]
+        print("\n".join("  " + f for f in fs) if fs else "  (sin archivos en ~/printer/gcode/)")
+    elif c == "upload":
+        if len(a) < 2 or not os.path.exists(a[1]):
+            print("uso: ender upload /ruta/archivo.gcode  (archivo debe existir)"); return
+        name = os.path.basename(a[1])
+        with open(a[1], "rb") as f:
+            req("/api/upload", "POST", raw=f.read(),
+                qs="?name=" + urllib.request.quote(name))
+        print(f"Subido: {name}")
+    elif c == "print":
+        if len(a) < 2:
+            print("uso: ender print archivo.gcode  (usa 'ender files' para ver)"); return
+        r = req("/api/print", "POST", {"file": a[1]})
+        print("▶ Imprimiendo" if r.get("ok") else "✗ No se pudo (¿archivo existe? ¿ya imprime?)")
+    elif c == "pause":
+        req("/api/pause", "POST", {}); print("⏸ pausa/resume alternado")
+    elif c == "resume":
+        s = req("/api/status")
+        if not s["paused"]:
+            req("/api/pause", "POST", {})
+        print("▶ reanudando")
+    elif c == "cancel":
+        req("/api/cancel", "POST", {}); print("⏹ cancelando (apaga calentadores y sube Z)")
+    else:
+        print("Comando desconocido:", c, "\n")
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except urllib.error.URLError as e:
+        print("✗ Error de conexión:", e)
+        print("  ¿Está corriendo el servidor?  ender serve")

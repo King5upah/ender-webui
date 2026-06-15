@@ -1,0 +1,12 @@
+# gcode generado y modelos
+gcode/
+*.gcode
+*.stl
+.cache/
+
+# python
+__pycache__/
+*.pyc
+
+# logs
+*.log
