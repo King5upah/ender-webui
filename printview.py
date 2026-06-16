@@ -148,6 +148,12 @@ class PrintView:
                 break
         return self.frames.get(key)
 
+    def full_frame(self):
+        """PNG bytes del modelo COMPLETO (preview del slice entero)."""
+        if not self.frame_keys:
+            return None
+        return self.frames.get(self.frame_keys[-1])
+
     def info(self, done):
         li = self.current_layer(done) if self.layer_start else 0
         z = self.layer_z[li] if self.layer_z else 0.0
