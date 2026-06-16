@@ -390,6 +390,12 @@ label{display:block;color:var(--mut);font-size:12px;margin:8px 0 4px}
   </div>
 
   <div class="card">
+    <h2>Preview del slice 🧩</h2>
+    <img id="sliceview" style="width:100%;border-radius:8px;background:#0d1117;display:block" alt="">
+    <small id="sliceinfo" style="display:block;margin-top:8px;text-align:center">— sin impresión activa —</small>
+  </div>
+
+  <div class="card">
     <h2>Energía ⚡</h2>
     <div class="temps">
       <div class="temp"><b id="e_w">--</b><span> W ahora</span></div>
@@ -471,8 +477,12 @@ async function tick(){
       if(v.ready&&v.total_layers){
         $('layerview').src='/api/print/frame.png?d='+(s.progress.done||0);
         $('layerinfo').textContent=`Capa ${v.layer}/${v.total_layers} · Z ${v.z} mm`;
-      }else{$('layerinfo').textContent='preparando render…';}
-    }else{$('layerinfo').textContent='— sin impresión activa —';}
+        if(!$('sliceview').src||$('sliceview').dataset.f!==v.file){
+          $('sliceview').src='/api/print/preview.png?f='+encodeURIComponent(v.file);
+          $('sliceview').dataset.f=v.file;}
+        $('sliceinfo').textContent=v.file+' — '+v.total_layers+' capas';
+      }else{$('layerinfo').textContent='preparando render…';$('sliceinfo').textContent='preparando preview…';}
+    }else{$('layerinfo').textContent='— sin impresión activa —';$('sliceinfo').textContent='— sin impresión activa —';}
   }catch(e){$('dot').className='dot';$('port').textContent='servidor caído'}
 }
 async function drawChart(){
@@ -541,6 +551,11 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(P.view.info(P.progress["done"])))
         if u.path == "/api/print/frame.png":
             png = P.view.frame_for(P.progress["done"])
+            if png:
+                return self._send(200, png, "image/png")
+            return self._send(404, "{}")
+        if u.path == "/api/print/preview.png":
+            png = P.view.full_frame()      # preview del slice completo
             if png:
                 return self._send(200, png, "image/png")
             return self._send(404, "{}")
